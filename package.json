@@ -1,0 +1,20 @@
+{
+  "name": "node-restarter",
+  "version": "0.0.1",
+  "description": "Inspector protocol server that can restart Node.",
+  "main": "restarter.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "inspector",
+    "debug",
+    "debugger",
+    "tools"
+  ],
+  "author": "Yevgen Ostroukhov",
+  "license": "BSD-2-Clause",
+  "dependencies": {
+    "ws": "~1.1.1"
+  }
+}
