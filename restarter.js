@@ -156,7 +156,10 @@ function main() {
   const inferior = new Inferior(CHILD_PORT);
   const server = Http.createServer();
   server.listen(PORT, function() {
-    console.log('Listening on ' + server.address().port);
+    console.log('Listening on port ' + server.address().port + '.');
+    console.log(
+        'Open chrome-devtools://devtools/bundled/inspector.html?experiments=true&ws=127.0.0.1:' +
+        server.address().port + ' in Chrome browser.');
   });
   const wss = new WebSocket.Server({server});
   wss.on('connection', ws => {
