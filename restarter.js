@@ -1,21 +1,12 @@
-var child_process = require('child_process');
-var http = require('http');
-var WebSocket = require('ws');
+const ChildProcess = require('child_process');
+const Http = require('http');
+const WebSocket = require('ws');
 
 const PORT = 9229;
 const CHILD_PORT = 9227;
 
-const IS_RESTARTING_SYMBOL = Symbol('restarting');
-const PORT_SYMBOL = Symbol('port');
-const PROCESS_SYMBOL = Symbol('process');
-const URL_SYMBOL = Symbol('url');
-
-let child = null;
-let frontend = null;
-let pendingMessages = [];
-
 function httpRequest(port, path, callback) {
-  http.get('http://127.0.0.1:' + port + path, response => {
+  Http.get('http://127.0.0.1:' + port + path, response => {
     if (response.statusCode !== 200) {
       throw new Error("HTTP error " + response.statusCode +
           " fetching " + path);
@@ -29,68 +20,6 @@ function httpRequest(port, path, callback) {
           callback(JSON.parse(buffer.toString()));
         });
   });
-}
-
-function postMessageToFrontend(message) {
-  frontend.send(message);
-}
-
-function restartNode(child, requestId) {
-  const connection = child;
-  const child_process = child[PROCESS_SYMBOL];
-  const port = child[PORT_SYMBOL];
-  child = null;
-  httpRequest(port, '/json/__inspector_state/', state => {
-    child_process[IS_RESTARTING_SYMBOL] = true;
-    connection.close();
-    child_process.kill();
-    postMessageToFrontend(JSON.stringify({'id': requestId, result: {}}));
-    postMessageToFrontend(JSON.stringify({
-      'message': 'Runtime.executionContextDestroyed',
-      'params':{'executionContextId':1}
-    }));
-    postMessageToFrontend(JSON.stringify({
-      'message': 'Runtime.executionContextsCleared',
-      'params':{}
-    }));
-    startNode_(port, JSON.stringify(state));
-  });
-}
-
-function consumeMessage(message) {
-  const json = JSON.parse(message);
-  if (json['method'] == 'Page.reload') {
-    const connection = child;
-    child = null;
-    restartNode(connection, json['id']);
-    return true;
-  }
-  return false;
-}
-
-function postMessageFromFrontend(message) {
-  if (!child) {
-    pendingMessages.push(message);
-  } else if (!consumeMessage(message)) {
-    child.send(message);
-  }
-}
-
-function frontendConnected(ws) {
-  if (frontend) {
-    ws.close();
-    return;
-  }
-  frontend = ws;
-  ws.on('close', () => {
-    child.close();
-    child = null;
-    frontend = null;
-  });
-  ws.on('message', message => {
-    postMessageFromFrontend(message);
-  });
-  return true;
 }
 
 function waitForStart(stream, callback) {
@@ -107,50 +36,138 @@ function waitForStart(stream, callback) {
   });
 }
 
-function connectToChild(subProcess, state, url, port) {
-    subProcess[URL_SYMBOL] = url;
-    const headers = state ? {'XInspectorStateCookie' : state} : {};
-    const nodeConnection = new WebSocket(subProcess[URL_SYMBOL], [], { headers });
-    nodeConnection[PORT_SYMBOL] = port
-    nodeConnection[PROCESS_SYMBOL] = subProcess;
-    nodeConnection.on('open', () => {
-      child = nodeConnection;
+class Inferior {
+  constructor(port) {
+    this.port_ = port;
+    this.frontend_ = null;
+    this.connection_ = null;
+    this.child_process_ = null;
+    this.url_ = null;
+    this.starting_ = false;
+    this.pendingMessages_ = [];
+  }
+
+  setFrontend(frontend) {
+    if (frontend && this.frontend_) {
+      return false;;
+    }
+    this.frontend_ = frontend;
+    if (frontend) {
+      this.connect(null);
+      frontend.on('message', message => this.toBackend(message));
+      frontend.on('close', () => this.setFrontend(null));
+    } else {
+      this.connection_.close();
+    }
+    return true;
+  }
+
+  connect(state) {
+    if (this.child_process_) {
+      const headers =
+          state ? {'XInspectorStateCookie' : JSON.stringify(state)} : {};
+      const nodeConnection = new WebSocket(this.url_, [], { headers });
+      nodeConnection.on('open', () => {
+        if (!this.frontend_) {
+          nodeConnection.close();
+        } else {
+          this.connection_ = nodeConnection;
+          this.pendingMessages_.forEach(
+              message => nodeConnection.send(message));
+          this.pendingMessages_ = [];
+        }
+      });
+      nodeConnection.on('message', message => this.toFrontend(message));
+      nodeConnection.on('close', () => this.connection_ = null);
+    } else {
+      this.start();
+    }
+  }
+
+  consumeMessage(message) {
+    const json = JSON.parse(message);
+    if (json['method'] == 'Page.reload') {
+      this.restartNode(json['id']);
+      return true;
+    }
+    return false;
+  }
+
+  kill() {
+    if (!this.child_process_)
+      return;
+    let child_process = this.child_process_;
+    this.child_process_ = null;
+    child_process.kill();
+  }
+
+  toBackend(message) {
+    if (!this.consumeMessage(message)) {
+      if (this.connection_)
+        this.connection_.send(message);
+      else
+        this.pendingMessages_.push(message);
+    }
+  }
+
+  restartNode(requestId) {
+    httpRequest(this.port_, '/json/__inspector_state/', state => {
+      const child_process = this.child_process_;
+      this.child_process_ = null;
+      child_process.kill();
+      this.toFrontend(JSON.stringify({'id': requestId, result: {}}));
+      this.start(state);
     });
-    nodeConnection.on('message', postMessageToFrontend);
+  }
+
+  toFrontend(message) {
+    this.frontend_ && this.frontend_.send(message);
+  }
+
+  start(state) {
+    if (this.starting_)
+      return;
+    this.starting_ = true;
+    const argv = process.argv;
+    const script = argv.length > 2 ? argv[2] : null;
+    const args = argv.length > 3 ? argv.slice(3) : [];
+    const execArgv = ['--inspect=' + this.port_, '--debug-brk'];
+    const subProcess = ChildProcess.fork(script, args, {
+      execArgv, stdio: [0, 1, 'pipe', 'ipc'],
+    });
+    subProcess.on('exit', errorCode => {
+      if (this.child_process_)
+        process.exit(errorCode);
+    });
+    waitForStart(subProcess.stderr, () => this.started_(subProcess, state));
+  }
+
+  started_(subProcess, state) {
+    this.starting_ = false;
+    this.child_process_ = subProcess;
+    httpRequest(this.port_, '/json/list', response => {
+      this.url_ = response[0]['webSocketDebuggerUrl'];
+      this.frontend_ && this.connect(state);
+    });
+  }
 }
 
-function startNode_(port, state) {
-  const argv = process.argv;
-  const script = argv.length > 2 ? argv[2] : null;
-  const args = argv.length > 3 ? argv.slice(3) : [];
-
-  const execArgv = ['--inspect=' + port];
-  if (!state)
-    execArgv.push('--debug-brk');
-
-  const subProcess = child_process.fork(script, args, {
-    execArgv, stdio: [0, 1, 'pipe', 'ipc'],
+function main() {
+  const inferior = new Inferior(CHILD_PORT);
+  const server = Http.createServer();
+  server.listen(PORT, function() {
+    console.log('Listening on ' + server.address().port);
   });
-  subProcess.on('exit', errorCode => {
-    if (!subProcess[IS_RESTARTING_SYMBOL]) process.exit(errorCode);
+  const wss = new WebSocket.Server({server});
+  wss.on('connection', ws => {
+    if (!inferior.setFrontend(ws)) {
+      ws.close();
+    }
   });
-
-  const connect =
-      (url => connectToChild(subProcess, state, url, port));
-  waitForStart(subProcess.stderr, () => httpRequest(port, '/json/list',
-    targets => connect(targets[0]['webSocketDebuggerUrl'])));
+  process.on('uncaughtException', e => {
+    inferior.kill();
+    throw e;
+  });
 }
 
-const server = http.createServer();
-server.listen(PORT, function() {
-  console.log('Listening on ' + server.address().port);
-});
-const wss = new WebSocket.Server({server});
-wss.on('connection', frontendConnected);
-
-process.on('uncaughtException', e => {
-  const proc = child && child[PROCESS_SYMBOL];
-  proc && proc.kill();
-  throw e;
-});
-startNode_(CHILD_PORT);
+main();
